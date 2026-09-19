@@ -1,0 +1,403 @@
+diff -ruN a/src/btree.c b/src/btree.c
+--- a/src/btree.c	2026-09-19 14:57:17.710531898 +0000
++++ b/src/btree.c	2026-09-19 14:57:17.710642670 +0000
+@@ -5136,6 +5136,14 @@
+   BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
+ #ifdef SQLITE_DIRECT_OVERFLOW_READ
+   unsigned char * const pBufStart = pBuf;     /* Start of original out buffer */
++
++#ifndef SQLITE_OMIT_INCRBLOB
++  /* OvVec: size in pages of the next speculative batch used while the
++  ** overflow chain is being traversed for the first time. It doubles
++  ** 8->16->32->64->128 for as long as the guesses continue to hold. */
++  int ovvecFirstWindow = 8;
++#endif
++
+ #endif
+ 
+   assert( pPage );
+@@ -5280,13 +5288,270 @@
+          && &pBuf[-4]>=pBufStart                               /* (6) */
+         ){
+           sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
+-          u8 aSave[4];
+-          u8 *aWrite = &pBuf[-4];
+-          assert( aWrite>=pBufStart );                         /* due to (6) */
+-          memcpy(aSave, aWrite, 4);
+-          rc = sqlite3OsRead(fd, aWrite, a+4, (i64)pBt->pageSize*(nextPage-1));
+-          nextPage = get4byte(aWrite);
+-          memcpy(aWrite, aSave, 4);
++
++#ifndef SQLITE_OMIT_INCRBLOB
++          /* OvVec (v5): speculative scatter/gather read for the first
++          ** traversal of an overflow chain, before aOverflow[] has been
++          ** populated. Once two consecutive physically-contiguous links
++          ** P[i-2]->P[i-1]->P[i] have been observed, speculatively read a
++          ** short contiguous run starting at P[i]. Each page is split into
++          ** its 4-byte next-page pointer (-> aNext[]) and payload
++          ** (-> pBuf); only the validated contiguous prefix is kept.
++          */
++          if( pCur->aOverflow
++           && pBt->usableSize==pBt->pageSize
++           && a==ovflSize
++           && amt>=ovflSize
++           && iIdx>=2
++           && pCur->aOverflow[iIdx-2]+1==pCur->aOverflow[iIdx-1]
++           && pCur->aOverflow[iIdx-1]+1==nextPage
++           && sqlite3PagerDirectReadOk(pBt->pPager, nextPage)
++          ){
++            int nOvfl;
++            int nFull;
++            int nCand;
++            int accepted;
++            int j;
++            Pgno startPg = nextPage;
++            Pgno pgAfter;
++            unsigned char aNext[SQLITE_OVVEC_MAX_PAGES*4];
++            OvVecReadReq x;
++            int rcVec;
++
++            nOvfl = (pCur->info.nPayload-pCur->info.nLocal+ovflSize-1)/ovflSize;
++
++            /* If SQLite already knows the following page, the cached-chain
++            ** path below is preferable; this path is only for the first
++            ** traversal. */
++            if( iIdx+1<nOvfl && pCur->aOverflow[iIdx+1]!=0 ){
++              goto ovvec_v5_skip;
++            }
++
++            /* Number of complete overflow payloads remaining in this
++            ** accessPayload() request. */
++            nFull = amt/ovflSize;
++            if( nFull>nOvfl-iIdx ) nFull = nOvfl-iIdx;
++
++            nCand = ovvecFirstWindow;
++            if( nCand>nFull ) nCand = nFull;
++            if( nCand>SQLITE_OVVEC_MAX_PAGES ) nCand = SQLITE_OVVEC_MAX_PAGES;
++
++            /* Never speculate beyond the physical database. */
++            if( nextPage>pBt->nPage ){
++              nCand = 0;
++            }else if( (Pgno)nCand>pBt->nPage-nextPage+1 ){
++              nCand = (int)(pBt->nPage-nextPage+1);
++            }
++
++            /* Preserve SQLite's existing direct-read safety requirement
++            ** for every page in the candidate window. */
++            for(j=1; j<nCand; j++){
++              if( !sqlite3PagerDirectReadOk(pBt->pPager, nextPage+(Pgno)j) ){
++                nCand = j;
++                break;
++              }
++            }
++
++            /* A one-page preadv() is not useful. */
++            if( nCand>=2 ){
++              memset(&x, 0, sizeof(x));
++              x.iOffset = (i64)pBt->pageSize*(nextPage-1);
++              x.nPage = nCand;
++              x.szPage = pBt->pageSize;
++              x.szPayload = ovflSize;
++              x.pOut = pBuf;
++              x.aNext = aNext;
++
++              rcVec = sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x);
++
++              if( rcVec==SQLITE_OK ){
++                /* The first physical page is definitely the current
++                ** overflow page. */
++                accepted = 1;
++                pgAfter = get4byte(&aNext[0]);
++
++                /* Accept only the prefix whose links confirm that the next
++                ** logical overflow page is also the next physical page. */
++                while( accepted<nCand && pgAfter==startPg+(Pgno)accepted ){
++                  pgAfter = get4byte(&aNext[accepted*4]);
++                  accepted++;
++                }
++
++                /* Record accepted pages into SQLite's normal overflow
++                ** cache. */
++                for(j=0; j<accepted; j++){
++                  Pgno expected = startPg+(Pgno)j;
++                  assert( pCur->aOverflow[iIdx+j]==0
++                       || pCur->aOverflow[iIdx+j]==expected
++                       || CORRUPT_DB );
++                  pCur->aOverflow[iIdx+j] = expected;
++                }
++
++                /* Full success and chain continues physically forward:
++                ** 8->16->32->64->128 */
++                if( accepted==nCand && pgAfter==startPg+(Pgno)nCand ){
++                  if( ovvecFirstWindow<SQLITE_OVVEC_MAX_PAGES ){
++                    ovvecFirstWindow *= 2;
++                    if( ovvecFirstWindow>SQLITE_OVVEC_MAX_PAGES ){
++                      ovvecFirstWindow = SQLITE_OVVEC_MAX_PAGES;
++                    }
++                  }
++                }else{
++                  /* Run ended. Return to conservative window for the next
++                  ** newly-observed run. */
++                  ovvecFirstWindow = 8;
++                }
++
++                {
++                  int nByte = accepted*ovflSize;
++                  nextPage = pgAfter;
++                  amt -= nByte;
++                  pBuf += nByte;
++                  offset = 0;
++
++                  /* continue skips SQLite's normal iIdx++ at the bottom of
++                  ** while(nextPage), so consume the entire accepted prefix
++                  ** here. */
++                  iIdx += accepted;
++
++                  if( amt==0 ) return SQLITE_OK;
++                  continue;
++                }
++
++              }else if( rcVec!=SQLITE_NOTFOUND ){
++                return rcVec;
++              }
++            }
++          }
++
++ovvec_v5_skip:
++          ;
++#endif /* SQLITE_OMIT_INCRBLOB */
++
++#ifndef SQLITE_OMIT_INCRBLOB
++          /* OvVec: when the incremental-BLOB overflow-page cache already
++          ** contains a known physically contiguous run, batch those pages
++          ** into a single vectored read instead of one pread() per page.
++          */
++          if( pCur->aOverflow
++           && pBt->usableSize==pBt->pageSize
++           && a==ovflSize
++           && amt>=2*ovflSize
++           && pCur->aOverflow[iIdx+1]==nextPage+1
++          ){
++            int nOvfl;
++            int nFull;
++            int nBatch;
++            int j;
++
++            /* Number of overflow pages belonging to this payload. */
++            nOvfl = (pCur->info.nPayload-pCur->info.nLocal+ovflSize-1)/ovflSize;
++
++            /* Number of complete overflow payloads still requested. */
++            nFull = amt/ovflSize;
++            if( nFull>SQLITE_OVVEC_MAX_PAGES ) nFull = SQLITE_OVVEC_MAX_PAGES;
++            if( nFull>(nOvfl-iIdx) ) nFull = nOvfl-iIdx;
++
++            /* Page iIdx is nextPage. Grow nBatch only while following
++            ** entries have already been learned by SQLite's overflow-page
++            ** cache and are physically consecutive. */
++            nBatch = 1;
++            while( nBatch<nFull ){
++              Pgno pg = pCur->aOverflow[iIdx+nBatch];
++              if( pg==0 ) break;
++              if( pg!=nextPage+(Pgno)nBatch ) break;
++
++              /* Preserve all safety conditions of SQLite's existing
++              ** direct-overflow-read optimization. */
++              if( !sqlite3PagerDirectReadOk(pBt->pPager, pg) ) break;
++              nBatch++;
++            }
++
++            if( nBatch>=2 ){
++              unsigned char aNext[SQLITE_OVVEC_MAX_PAGES*4];
++              OvVecReadReq x;
++              int rcVec;
++              int bChainOk = 1;
++              Pgno pgAfter;
++
++              memset(&x, 0, sizeof(x));
++              x.iOffset = (i64)pBt->pageSize*(nextPage-1);
++              x.nPage = nBatch;
++              x.szPage = pBt->pageSize;
++              x.szPayload = ovflSize;
++              x.pOut = pBuf;
++              x.aNext = aNext;
++
++              rcVec = sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x);
++
++              if( rcVec==SQLITE_OK ){
++                /* Verify every internal overflow pointer against SQLite's
++                ** already-known aOverflow[] chain. */
++                for(j=0; j<nBatch-1; j++){
++                  Pgno expected = pCur->aOverflow[iIdx+j+1];
++                  if( get4byte(&aNext[j*4])!=expected ){
++                    bChainOk = 0;
++                    break;
++                  }
++                }
++
++                /* Pointer stored in the final page of this batch. */
++                pgAfter = get4byte(&aNext[(nBatch-1)*4]);
++
++                /* If SQLite already knows the next overflow page, validate
++                ** that pointer too. */
++                if( bChainOk
++                 && iIdx+nBatch<nOvfl
++                 && pCur->aOverflow[iIdx+nBatch]!=0
++                 && pgAfter!=pCur->aOverflow[iIdx+nBatch]
++                ){
++                  bChainOk = 0;
++                }
++
++                /* If this batch reaches the final overflow page, the chain
++                ** must terminate with page number zero. */
++                if( bChainOk && iIdx+nBatch==nOvfl && pgAfter!=0 ){
++                  bChainOk = 0;
++                }
++
++                if( bChainOk ){
++                  int nByte = nBatch*ovflSize;
++                  nextPage = pgAfter;
++                  amt -= nByte;
++                  pBuf += nByte;
++                  offset = 0;
++
++                  /* We are inside a while(nextPage) loop. The continue
++                  ** below skips the normal iIdx++ at the bottom of that
++                  ** loop, so advance by the entire batch here. */
++                  iIdx += nBatch;
++
++                  if( amt==0 ) return SQLITE_OK;
++                  continue;
++                }
++
++                /* If validation fails, discard the speculative vectored
++                ** result logically and run the original one-page path
++                ** below. Any bytes written ahead in pBuf will subsequently
++                ** be overwritten by the stock path before they are exposed
++                ** to the caller. */
++              }else if( rcVec!=SQLITE_NOTFOUND ){
++                return rcVec;
++              }
++            }
++          }
++#endif /* SQLITE_OMIT_INCRBLOB */
++
++          /* Original SQLite direct-overflow-read path. */
++          {
++            u8 aSave[4];
++            u8 *aWrite = &pBuf[-4];
++            assert( aWrite>=pBufStart );                         /* due to (6) */
++            memcpy(aSave, aWrite, 4);
++            rc = sqlite3OsRead(fd, aWrite, a+4, (i64)pBt->pageSize*(nextPage-1));
++            nextPage = get4byte(aWrite);
++            memcpy(aWrite, aSave, 4);
++          }
+         }else
+ #endif
+ 
+diff -ruN a/src/os.h b/src/os.h
+--- a/src/os.h	2026-09-19 14:57:17.711671971 +0000
++++ b/src/os.h	2026-09-19 14:57:17.712133229 +0000
+@@ -182,6 +182,33 @@
+ int sqlite3OsLock(sqlite3_file*, int);
+ int sqlite3OsUnlock(sqlite3_file*, int);
+ int sqlite3OsCheckReservedLock(sqlite3_file *id, int *pResOut);
++/*
++** OvVec prototype.
++**
++** Private file-control used internally by SQLite.
++**
++** It reads a physically contiguous run of overflow pages using
++** scatter/gather I/O. For each page:
++**
++**   bytes 0..3       -> aNext[]
++**   bytes 4..end     -> pOut[]
++**
++** The public sqlite3_io_methods ABI is unchanged.
++*/
++#define SQLITE_FCNTL_OVVEC_READ 0x4f565643
++#define SQLITE_OVVEC_MAX_PAGES 128
++
++typedef struct OvVecReadReq OvVecReadReq;
++
++struct OvVecReadReq {
++  i64 iOffset;              /* Byte offset of first database page */
++  int nPage;                /* Number of contiguous pages */
++  int szPage;               /* SQLite page size */
++  int szPayload;            /* szPage - 4 */
++  unsigned char *pOut;      /* Final BLOB destination */
++  unsigned char *aNext;     /* 4 bytes per page */
++};
++
+ int sqlite3OsFileControl(sqlite3_file*,int,void*);
+ void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
+ #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
+diff -ruN a/src/os_unix.c b/src/os_unix.c
+--- a/src/os_unix.c	2026-09-19 14:57:17.712632598 +0000
++++ b/src/os_unix.c	2026-09-19 14:57:17.713175759 +0000
+@@ -43,6 +43,10 @@
+ **   *  Definitions of sqlite3_vfs objects for all locking methods
+ **      plus implementations of sqlite3_os_init() and sqlite3_os_end().
+ */
++#if defined(__linux__)
++# include <sys/uio.h>
++#endif
++
+ #include "sqliteInt.h"
+ #if SQLITE_OS_UNIX              /* This file is used on unix only */
+ 
+@@ -4156,6 +4160,55 @@
+     }
+ #endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */
+ 
++#if defined(__linux__)
++    /* OvVec: read N contiguous SQLite overflow pages with a single
++    ** preadv(). The 4-byte next-page pointer of each page is scattered
++    ** into p->aNext; the remaining bytes are scattered directly into the
++    ** final BLOB output buffer, so no full-BLOB memcpy is needed. */
++    case SQLITE_FCNTL_OVVEC_READ: {
++      OvVecReadReq *p = (OvVecReadReq*)pArg;
++      struct iovec aIov[SQLITE_OVVEC_MAX_PAGES * 2];
++      ssize_t nRead;
++      ssize_t nExpect;
++      int i;
++
++      if( p==0
++       || p->nPage<1
++       || p->nPage>SQLITE_OVVEC_MAX_PAGES
++       || p->szPage<8
++       || p->szPayload!=(p->szPage-4)
++       || p->pOut==0
++       || p->aNext==0
++      ){
++        return SQLITE_NOTFOUND;
++      }
++
++      /* Each SQLite overflow page becomes two iovec entries:
++      ** [4-byte pointer][payload]. */
++      for(i=0; i<p->nPage; i++){
++        aIov[i*2].iov_base = &p->aNext[i*4];
++        aIov[i*2].iov_len = 4;
++        aIov[i*2+1].iov_base = &p->pOut[i*p->szPayload];
++        aIov[i*2+1].iov_len = (size_t)p->szPayload;
++      }
++
++      nExpect = (ssize_t)p->nPage * (ssize_t)p->szPage;
++
++      do{
++        nRead = preadv(pFile->h, aIov, p->nPage * 2, (off_t)p->iOffset);
++      }while( nRead<0 && errno==EINTR );
++
++      if( nRead<0 ){
++        pFile->lastErrno = errno;
++        return SQLITE_IOERR_READ;
++      }
++      if( nRead!=nExpect ){
++        return SQLITE_IOERR_SHORT_READ;
++      }
++      return SQLITE_OK;
++    }
++#endif
++
+     case SQLITE_FCNTL_NULL_IO: {
+       osClose(pFile->h);
+       pFile->h = -1;

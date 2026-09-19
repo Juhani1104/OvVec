@@ -1,6 +1,6 @@
 diff -ruN a/src/btree.c b/src/btree.c
---- a/src/btree.c	2026-09-19 14:57:17.710531898 +0000
-+++ b/src/btree.c	2026-09-19 14:57:17.710642670 +0000
+--- a/src/btree.c	2026-09-19 11:51:49.978784324 +0000
++++ b/src/btree.c	2026-09-19 16:42:23.521797365 +0000
 @@ -5136,6 +5136,14 @@
    BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
  #ifdef SQLITE_DIRECT_OVERFLOW_READ
@@ -295,8 +295,8 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
 diff -ruN a/src/os.h b/src/os.h
---- a/src/os.h	2026-09-19 14:57:17.711671971 +0000
-+++ b/src/os.h	2026-09-19 14:57:17.712133229 +0000
+--- a/src/os.h	2026-09-19 11:51:49.979784329 +0000
++++ b/src/os.h	2026-09-19 16:42:23.521919465 +0000
 @@ -182,6 +182,33 @@
  int sqlite3OsLock(sqlite3_file*, int);
  int sqlite3OsUnlock(sqlite3_file*, int);
@@ -332,19 +332,19 @@ diff -ruN a/src/os.h b/src/os.h
  void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
  #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
 diff -ruN a/src/os_unix.c b/src/os_unix.c
---- a/src/os_unix.c	2026-09-19 14:57:17.712632598 +0000
-+++ b/src/os_unix.c	2026-09-19 14:57:17.713175759 +0000
-@@ -43,6 +43,10 @@
- **   *  Definitions of sqlite3_vfs objects for all locking methods
- **      plus implementations of sqlite3_os_init() and sqlite3_os_end().
- */
+--- a/src/os_unix.c	2026-09-19 11:51:49.980784334 +0000
++++ b/src/os_unix.c	2026-09-19 16:42:23.521942277 +0000
+@@ -46,6 +46,10 @@
+ #include "sqliteInt.h"
+ #if SQLITE_OS_UNIX              /* This file is used on unix only */
+ 
 +#if defined(__linux__)
 +# include <sys/uio.h>
 +#endif
 +
- #include "sqliteInt.h"
- #if SQLITE_OS_UNIX              /* This file is used on unix only */
- 
+ /*
+ ** There are various methods for file locking used for concurrency
+ ** control:
 @@ -4156,6 +4160,55 @@
      }
  #endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */

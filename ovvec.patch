@@ -1,6 +1,6 @@
 diff -ruN a/src/btree.c b/src/btree.c
---- a/src/btree.c	2026-09-20 09:06:17.074893873 +0000
-+++ b/src/btree.c	2026-09-20 09:06:17.077207393 +0000
+--- a/src/btree.c	2026-09-20 09:42:03.099805098 +0000
++++ b/src/btree.c	2026-09-20 09:42:03.100360893 +0000
 @@ -5122,6 +5122,54 @@
  **   * A commit in auto_vacuum="full" mode,
  **   * Creating a table (may require moving an overflow page).
@@ -74,7 +74,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
    assert( pPage );
-@@ -5280,13 +5339,331 @@
+@@ -5280,13 +5339,332 @@
           && &pBuf[-4]>=pBufStart                               /* (6) */
          ){
            sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
@@ -404,9 +404,10 @@ diff -ruN a/src/btree.c b/src/btree.c
 +          {
 +            u8 aSave[4];
 +            u8 *aWrite = &pBuf[-4];
-+            assert( aWrite>=pBufStart );                         /* due to (6) */
++            assert( aWrite>=pBufStart );                      /* due to (6) */
 +            memcpy(aSave, aWrite, 4);
-+            rc = sqlite3OsRead(fd, aWrite, a+4, (i64)pBt->pageSize*(nextPage-1));
++            rc = sqlite3OsRead(fd, aWrite, a+4,
++                               (i64)pBt->pageSize*(nextPage-1));
 +            nextPage = get4byte(aWrite);
 +            memcpy(aWrite, aSave, 4);
 +          }
@@ -414,8 +415,8 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
 diff -ruN a/src/os.h b/src/os.h
---- a/src/os.h	2026-09-20 09:06:17.081369228 +0000
-+++ b/src/os.h	2026-09-20 09:06:17.083164344 +0000
+--- a/src/os.h	2026-09-20 09:42:03.100954389 +0000
++++ b/src/os.h	2026-09-20 09:42:03.101473224 +0000
 @@ -182,6 +182,56 @@
  int sqlite3OsLock(sqlite3_file*, int);
  int sqlite3OsUnlock(sqlite3_file*, int);
@@ -474,8 +475,8 @@ diff -ruN a/src/os.h b/src/os.h
  void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
  #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
 diff -ruN a/src/os_unix.c b/src/os_unix.c
---- a/src/os_unix.c	2026-09-20 09:06:17.086645359 +0000
-+++ b/src/os_unix.c	2026-09-20 09:06:17.088213127 +0000
+--- a/src/os_unix.c	2026-09-20 09:42:03.102001149 +0000
++++ b/src/os_unix.c	2026-09-20 09:42:03.102968686 +0000
 @@ -46,6 +46,10 @@
  #include "sqliteInt.h"
  #if SQLITE_OS_UNIX              /* This file is used on unix only */

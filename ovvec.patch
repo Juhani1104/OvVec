@@ -1,6 +1,6 @@
 diff -ruN a/src/btree.c b/src/btree.c
---- a/src/btree.c	2026-09-22 16:29:58.126203771 +0000
-+++ b/src/btree.c	2026-09-22 16:29:58.126660609 +0000
+--- a/src/btree.c	2026-09-22 16:41:48.950271119 +0000
++++ b/src/btree.c	2026-09-22 16:41:48.950821394 +0000
 @@ -5122,6 +5122,60 @@
  **   * A commit in auto_vacuum="full" mode,
  **   * Creating a table (may require moving an overflow page).
@@ -127,7 +127,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +            ** path below is preferable; this path is only for the first
 +            ** traversal. */
 +            if( iIdx+1<nOvfl && pCur->aOverflow[iIdx+1]!=0 ){
-+              goto ovvec_v5_skip;
++              goto ovvec_out;
 +            }
 +
 +            /* Number of complete overflow payloads remaining in this
@@ -290,7 +290,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +            }
 +          }
 +
-+ovvec_v5_skip:
++ovvec_out:
 +          ;
 +#endif /* SQLITE_OMIT_INCRBLOB */
 +
@@ -429,8 +429,8 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
 diff -ruN a/src/os.h b/src/os.h
---- a/src/os.h	2026-09-22 16:29:58.127543369 +0000
-+++ b/src/os.h	2026-09-22 16:29:58.127914646 +0000
+--- a/src/os.h	2026-09-22 16:41:48.951342624 +0000
++++ b/src/os.h	2026-09-22 16:41:48.951803941 +0000
 @@ -182,6 +182,56 @@
  int sqlite3OsLock(sqlite3_file*, int);
  int sqlite3OsUnlock(sqlite3_file*, int);
@@ -489,8 +489,8 @@ diff -ruN a/src/os.h b/src/os.h
  void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
  #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
 diff -ruN a/src/os_unix.c b/src/os_unix.c
---- a/src/os_unix.c	2026-09-22 16:29:58.128688140 +0000
-+++ b/src/os_unix.c	2026-09-22 16:29:58.129128889 +0000
+--- a/src/os_unix.c	2026-09-22 16:41:48.952291367 +0000
++++ b/src/os_unix.c	2026-09-22 16:41:48.952842313 +0000
 @@ -46,6 +46,10 @@
  #include "sqliteInt.h"
  #if SQLITE_OS_UNIX              /* This file is used on unix only */

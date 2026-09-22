@@ -1,7 +1,7 @@
 diff -ruN a/src/btree.c b/src/btree.c
---- a/src/btree.c	2026-09-20 09:42:03.099805098 +0000
-+++ b/src/btree.c	2026-09-20 09:42:03.100360893 +0000
-@@ -5122,6 +5122,54 @@
+--- a/src/btree.c	2026-09-22 16:29:58.126203771 +0000
++++ b/src/btree.c	2026-09-22 16:29:58.126660609 +0000
+@@ -5122,6 +5122,60 @@
  **   * A commit in auto_vacuum="full" mode,
  **   * Creating a table (may require moving an overflow page).
  */
@@ -36,13 +36,19 @@ diff -ruN a/src/btree.c b/src/btree.c
 +** the pages are already in the page cache -- which is exactly where a fixed
 +** window was measured to lose.  Reading the previous run's length out of the
 +** chain cache costs nothing and needs no extra state.
++**
++** The scan stops once nLimit pages have been counted, so a caller that only
++** needs to distinguish "at least N" pays O(N) rather than O(run).  Without
++** that bound the walk is repeated for every speculative decision and the cost
++** of reading one BLOB grows quadratically: measured at 67,452 backwards steps
++** for a 16 MiB BLOB but 67,298,517 for a 512 MiB one.
 +*/
-+static int ovvecRunLenAt(Pgno *a, int iEnd){
++static int ovvecRunLenAt(Pgno *a, int iEnd, int nLimit){
 +  int n = 1;
 +  int d = 0;
 +  int i = iEnd;
 +  if( iEnd<0 || a[iEnd]==0 ) return 0;
-+  while( i>0 && a[i-1]!=0 ){
++  while( i>0 && n<nLimit && a[i-1]!=0 ){
 +    int dd = (a[i-1]+1==a[i]) ? 1 : (a[i]+1==a[i-1]) ? -1 : 0;
 +    if( dd==0 || (d!=0 && dd!=d) ) break;
 +    d = dd;
@@ -56,7 +62,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  static int accessPayload(
    BtCursor *pCur,      /* Cursor pointing to entry to read from */
    u32 offset,          /* Begin reading this far into payload */
-@@ -5136,6 +5184,17 @@
+@@ -5136,6 +5190,17 @@
    BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
  #ifdef SQLITE_DIRECT_OVERFLOW_READ
    unsigned char * const pBufStart = pBuf;     /* Start of original out buffer */
@@ -74,7 +80,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
    assert( pPage );
-@@ -5280,13 +5339,332 @@
+@@ -5280,13 +5345,340 @@
           && &pBuf[-4]>=pBufStart                               /* (6) */
          ){
            sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
@@ -134,8 +140,16 @@ diff -ruN a/src/btree.c b/src/btree.c
 +            ** long the previous run turned out to be.  Fall back to the
 +            ** doubling schedule only while no complete run has been seen. */
 +            {
-+              int nInRun = ovvecRunLenAt(pCur->aOverflow, iIdx-1);
-+              int nPrev  = ovvecRunLenAt(pCur->aOverflow, iIdx-nInRun-1);
++              /* Four pages is all that is needed to tell whether this run is
++              ** already established; beyond that the previous run's length is
++              ** never consulted, so neither walk has to be unbounded. */
++              int nInRun = ovvecRunLenAt(pCur->aOverflow, iIdx-1, 4);
++              /* The window is nPrev-nInRun, and it must still be able to reach
++              ** SQLITE_OVVEC_MAX_PAGES, so the bound on nPrev has to leave room
++              ** for the subtraction: nInRun is below 4 on this branch. */
++              int nPrev  = nInRun>=4 ? 0
++                         : ovvecRunLenAt(pCur->aOverflow, iIdx-nInRun-1,
++                                         SQLITE_OVVEC_MAX_PAGES+4);
 +              if( nInRun>=4 ){
 +                /* Already well inside a run: this run has proven itself, so
 +                ** grow with the doubling schedule instead of taking a prior
@@ -415,8 +429,8 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
 diff -ruN a/src/os.h b/src/os.h
---- a/src/os.h	2026-09-20 09:42:03.100954389 +0000
-+++ b/src/os.h	2026-09-20 09:42:03.101473224 +0000
+--- a/src/os.h	2026-09-22 16:29:58.127543369 +0000
++++ b/src/os.h	2026-09-22 16:29:58.127914646 +0000
 @@ -182,6 +182,56 @@
  int sqlite3OsLock(sqlite3_file*, int);
  int sqlite3OsUnlock(sqlite3_file*, int);
@@ -475,8 +489,8 @@ diff -ruN a/src/os.h b/src/os.h
  void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
  #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
 diff -ruN a/src/os_unix.c b/src/os_unix.c
---- a/src/os_unix.c	2026-09-20 09:42:03.102001149 +0000
-+++ b/src/os_unix.c	2026-09-20 09:42:03.102968686 +0000
+--- a/src/os_unix.c	2026-09-22 16:29:58.128688140 +0000
++++ b/src/os_unix.c	2026-09-22 16:29:58.129128889 +0000
 @@ -46,6 +46,10 @@
  #include "sqliteInt.h"
  #if SQLITE_OS_UNIX              /* This file is used on unix only */

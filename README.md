@@ -161,6 +161,7 @@ bench/*.c            the benchmark and test drivers
 bench/tools/         replay, fuzzing and inspection tools
 bench/README.md      detailed notes on the read path and how it was measured
 docs/results.svg     the chart above
+LICENSE              CC0 1.0
 ```
 
 ## Limitations
@@ -198,3 +199,8 @@ docs/results.svg     the chart above
   noise.
 - Linux only (`preadv`/`pwritev`), SQLite 3.53.4 only, and not part of upstream
   SQLite.
+
+## License
+
+[CC0 1.0](LICENSE): no rights reserved. SQLite itself is in the public domain,
+and this patch follows it.

@@ -3,3 +3,8 @@ sqlite-src-3530400.zip
 ovvec-stock/
 ovvec-patched/
 bench/build/
+alloc/
+write/
+del/
+noreuse/
+combined/

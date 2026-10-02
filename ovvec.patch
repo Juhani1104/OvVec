@@ -1,11 +1,49 @@
 diff -ruN a/src/btree.c b/src/btree.c
---- a/src/btree.c	2026-09-22 16:41:48.950271119 +0000
-+++ b/src/btree.c	2026-09-22 16:41:48.950821394 +0000
-@@ -5122,6 +5122,60 @@
+--- a/src/btree.c	2026-10-02 11:22:05.539962682 +0000
++++ b/src/btree.c	2026-10-02 11:22:05.540482960 +0000
+@@ -682,6 +682,8 @@
+ static void btreeClearHasContent(BtShared *pBt){
+   sqlite3BitvecDestroy(pBt->pHasContent);
+   pBt->pHasContent = 0;
++  pBt->iOldTrunk = 0;
++  pBt->nOldLeaf = 0;
+ }
+ 
+ /*
+@@ -5122,6 +5124,89 @@
  **   * A commit in auto_vacuum="full" mode,
  **   * Creating a table (may require moving an overflow page).
  */
 +#ifdef SQLITE_DIRECT_OVERFLOW_READ
++/*
++** OvVec: may overflow page pgno be read straight from the database file?
++**
++** sqlite3PagerDirectReadOk() refuses whenever any page in the cache is
++** dirty, which rules out every read made inside a write transaction --
++** UPDATE ... SET b=f(b), INSERT ... SELECT, or maintaining an index on a
++** column stored after a large value, which must read the whole value first.
++** What actually matters is this one page: a page leaves the cache only once
++** it is clean, so if it is neither cached nor in the WAL the file holds its
++** current content. The read happens at once, so that cannot change first.
++*/
++static int ovvecDirectReadOk(BtShared *pBt, Pgno pgno){
++  DbPage *pCached;
++  sqlite3_file *fd;
++  if( sqlite3PagerDirectReadOk(pBt->pPager, pgno) ) return 1;
++  if( !sqlite3PagerOvvecDiskOk(pBt->pPager, pgno) ) return 0;
++  fd = sqlite3PagerFile(pBt->pPager);
++  if( (fd->pMethods->xDeviceCharacteristics(fd)
++        & SQLITE_IOCAP_SUBPAGE_READ)==0 ){
++    return 0;
++  }
++  pCached = sqlite3PagerLookup(pBt->pPager, pgno);
++  if( pCached ){
++    sqlite3PagerUnref(pCached);
++    return 0;
++  }
++  return 1;
++}
++
 +/*
 +** OvVec: classify three successive overflow pages of a chain.
 +**
@@ -62,7 +100,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  static int accessPayload(
    BtCursor *pCur,      /* Cursor pointing to entry to read from */
    u32 offset,          /* Begin reading this far into payload */
-@@ -5136,6 +5190,17 @@
+@@ -5136,6 +5221,17 @@
    BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
  #ifdef SQLITE_DIRECT_OVERFLOW_READ
    unsigned char * const pBufStart = pBuf;     /* Start of original out buffer */
@@ -80,7 +118,21 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
    assert( pPage );
-@@ -5280,13 +5345,340 @@
+@@ -5265,7 +5361,7 @@
+         **
+         **   1) this is a read operation, and
+         **   2) data is required from the start of this overflow page, and
+-        **   3) there are no dirty pages in the page-cache
++        **   3) the page is not in the page-cache (see ovvecDirectReadOk())
+         **   4) the database is file-backed, and
+         **   5) the page is not in the WAL file
+         **   6) at least 4 bytes have already been read into the output buffer
+@@ -5276,17 +5372,346 @@
+         */
+         if( eOp==0                                             /* (1) */
+          && offset==0                                          /* (2) */
+-         && sqlite3PagerDirectReadOk(pBt->pPager, nextPage)    /* (3,4,5) */
++         && ovvecDirectReadOk(pBt, nextPage)            /* (3,4,5) */
           && &pBuf[-4]>=pBufStart                               /* (6) */
          ){
            sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
@@ -108,7 +160,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +           && iIdx>=2
 +           && (ovvecDir = ovvecRunDir(pCur->aOverflow[iIdx-2],
 +                                      pCur->aOverflow[iIdx-1], nextPage))!=0
-+           && sqlite3PagerDirectReadOk(pBt->pPager, nextPage)
++           && ovvecDirectReadOk(pBt, nextPage)
 +          ){
 +            int nOvfl;
 +            int nFull;
@@ -202,7 +254,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +            ** for every page in the candidate window. */
 +            for(j=1; j<nCand; j++){
 +              Pgno pgJ = ovvecDir>0 ? nextPage+(Pgno)j : nextPage-(Pgno)j;
-+              if( !sqlite3PagerDirectReadOk(pBt->pPager, pgJ) ){
++              if( !ovvecDirectReadOk(pBt, pgJ) ){
 +                nCand = j;
 +                break;
 +              }
@@ -221,6 +273,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +              x.szPayload = ovflSize;
 +              x.pOut = pBuf;
 +              x.aNext = aNext;
++              x.bSink = 0;
 +
 +              rcVec = sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x);
 +
@@ -333,7 +386,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +
 +              /* Preserve all safety conditions of SQLite's existing
 +              ** direct-overflow-read optimization. */
-+              if( !sqlite3PagerDirectReadOk(pBt->pPager, pg) ) break;
++              if( !ovvecDirectReadOk(pBt, pg) ) break;
 +              nBatch++;
 +            }
 +
@@ -353,6 +406,7 @@ diff -ruN a/src/btree.c b/src/btree.c
 +              x.szPayload = ovflSize;
 +              x.pOut = pBuf;
 +              x.aNext = aNext;
++              x.bSink = 0;
 +
 +              rcVec = sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x);
 +
@@ -428,10 +482,631 @@ diff -ruN a/src/btree.c b/src/btree.c
          }else
  #endif
  
+@@ -6511,6 +6936,150 @@
+ ** to nearby if any such page exists.  If eMode is BTALLOC_ANY then there
+ ** are no restrictions on which page is returned.
+ */
++/*
++** Return true if pages freed by the current transaction should not be
++** handed out again before it commits.
++**
++** Reusing such a page overwrites content that the rollback journal must be
++** able to restore, so the pager reads the old page and journals it before
++** the new content goes in (see btreeSetHasContent()). Replacing a large
++** value therefore writes the old value to the journal in full -- the same
++** number of bytes again as the new value. A leaf freed by an earlier
++** transaction is reused with neither a read nor a journal record, and a page
++** appended past the original end of the file needs no journal record either.
++**
++** WAL and in-memory journals do not copy old content, and auto-vacuum
++** relies on the free-list being consumed before it truncates, so they keep
++** the stock behaviour.
++*/
++static int btreeAvoidFreshPages(BtShared *pBt){
++  int eMode;
++  if( pBt->autoVacuum ) return 0;
++  eMode = sqlite3PagerGetJournalMode(pBt->pPager);
++  return eMode==PAGER_JOURNALMODE_DELETE
++      || eMode==PAGER_JOURNALMODE_PERSIST
++      || eMode==PAGER_JOURNALMODE_TRUNCATE;
++}
++
++/*
++** Take the free-list leaf nearest to 'nearby' among those that were already
++** free when the current transaction began. Set *pbFound to 0 and leave the
++** free-list untouched if there is none, in which case the caller appends.
++**
++** Pages freed by this transaction are marked in pHasContent -- including the
++** ones that became trunks (see freePage2()), so a trunk created by this
++** transaction, which can hold only such leaves, is passed over unread.
++** freePage2() only ever appends a leaf to the end of a trunk, so on an older
++** trunk the leaves that predate the transaction are a prefix of its array;
++** removal below keeps them one, and BtShared.iOldTrunk/nOldLeaf remember its
++** length so that no leaf has to be tested against the bitvec; a trunk with
++** none left is marked like a new one. The cache
++** only steers the choice: whether the page is loaded or not is still decided
++** by btreeGetHasContent(), exactly as in the stock path.
++*/
++static int btreeAllocOldLeaf(
++  BtShared *pBt,
++  Pgno nearby,
++  u32 nFree,
++  Pgno *pPgno,
++  MemPage **ppPage,
++  int *pbFound
++){
++  MemPage *pPage1 = pBt->pPage1;
++  MemPage *pTrunk = 0;
++  Pgno mxPage = btreePagecount(pBt);
++  Pgno iTrunk = get4byte(&pPage1->aData[32]);
++  u32 nSearch = 0;
++  int rc = SQLITE_OK;
++
++  *pbFound = 0;
++  while( iTrunk ){
++    u32 k, kOld, i, closest = 0;
++    int dist = -1;
++    unsigned char *aData;
++    if( iTrunk>mxPage || nSearch++>nFree ){
++      rc = SQLITE_CORRUPT_PGNO(iTrunk);
++      break;
++    }
++    rc = btreeGetPage(pBt, iTrunk, &pTrunk, 0);
++    if( rc ) break;
++    aData = pTrunk->aData;
++    if( btreeGetHasContent(pBt, iTrunk) ){
++      /* Created by this transaction; its next pointer is all we need */
++      goto next_trunk;
++    }
++    k = get4byte(&aData[4]);
++    if( k>(u32)(pBt->usableSize/4 - 2) ){
++      rc = SQLITE_CORRUPT_PGNO(iTrunk);
++      break;
++    }
++    if( pBt->iOldTrunk==iTrunk && pBt->nOldLeaf<=k ){
++      kOld = pBt->nOldLeaf;
++    }else{
++      kOld = k;
++      while( kOld>0 && btreeGetHasContent(pBt, get4byte(&aData[4+kOld*4])) ){
++        kOld--;
++      }
++    }
++    pBt->iOldTrunk = iTrunk;
++    pBt->nOldLeaf = kOld;
++    if( kOld==0 ){
++      /* Nothing older left here: mark it so later calls skip it unread,
++      ** like a trunk this transaction created. The bit only matters to a
++      ** page taken as a leaf, which a trunk never is. */
++      rc = btreeSetHasContent(pBt, iTrunk);
++      if( rc ) break;
++      goto next_trunk;
++    }
++    for(i=0; i<kOld; i++){
++      int d2 = nearby>0 ? sqlite3AbsInt32(get4byte(&aData[8+i*4]) - nearby) : 0;
++      if( dist<0 || d2<dist ){
++        closest = i;
++        dist = d2;
++        if( d2<=1 ) break;
++      }
++    }
++    if( dist>=0 ){
++      Pgno iPage = get4byte(&aData[8+closest*4]);
++      int noContent;
++      if( iPage>mxPage || iPage<2 ){
++        rc = SQLITE_CORRUPT_PGNO(iTrunk);
++        break;
++      }
++      rc = sqlite3PagerWrite(pPage1->pDbPage);
++      if( rc ) break;
++      rc = sqlite3PagerWrite(pTrunk->pDbPage);
++      if( rc ) break;
++      put4byte(&pPage1->aData[36], nFree-1);
++      /* Close the gap with the last older leaf, then the gap that leaves
++      ** with the last leaf of all, so the older leaves stay a prefix. */
++      memcpy(&aData[8+closest*4], &aData[4+kOld*4], 4);
++      memcpy(&aData[4+kOld*4], &aData[4+k*4], 4);
++      put4byte(&aData[4], k-1);
++      pBt->nOldLeaf = kOld-1;
++      TRACE(("ALLOCATE: %u was old leaf on trunk %u\n", iPage, iTrunk));
++      *pPgno = iPage;
++      noContent = !btreeGetHasContent(pBt, iPage) ? PAGER_GET_NOCONTENT : 0;
++      rc = btreeGetUnusedPage(pBt, iPage, ppPage, noContent);
++      if( rc==SQLITE_OK ){
++        rc = sqlite3PagerWrite((*ppPage)->pDbPage);
++        if( rc!=SQLITE_OK ){
++          releasePage(*ppPage);
++          *ppPage = 0;
++        }
++      }
++      if( rc==SQLITE_OK ) *pbFound = 1;
++      break;
++    }
++next_trunk:
++    iTrunk = get4byte(aData);
++    releasePage(pTrunk);
++    pTrunk = 0;
++  }
++  releasePage(pTrunk);
++  return rc;
++}
++
+ static int allocateBtreePage(
+   BtShared *pBt,         /* The btree */
+   MemPage **ppPage,      /* Store pointer to the allocated page here */
+@@ -6537,6 +7106,14 @@
+   if( n>=mxPage ){
+     return SQLITE_CORRUPT_BKPT;
+   }
++  if( n>0 && eMode==BTALLOC_ANY && btreeAvoidFreshPages(pBt)
++   && pBt->pHasContent!=0
++  ){
++    int bFound;
++    rc = btreeAllocOldLeaf(pBt, nearby, n, pPgno, ppPage, &bFound);
++    if( rc || bFound ) goto end_allocate_page;
++    goto allocate_at_end;
++  }
+   if( n>0 ){
+     /* There are pages on the freelist.  Reuse one of those pages. */
+     Pgno iTrunk;
+@@ -6753,6 +7330,7 @@
+       pPrevTrunk = 0;
+     }while( searchList );
+   }else{
++allocate_at_end: ;
+     /* There are no pages on the freelist, so append a new page to the
+     ** database image.
+     **
+@@ -6957,6 +7535,11 @@
+   put4byte(pPage->aData, iTrunk);
+   put4byte(&pPage->aData[4], 0);
+   put4byte(&pPage1->aData[32], iPage);
++  if( btreeAvoidFreshPages(pBt) ){
++    /* Lets btreeAllocOldLeaf() skip this trunk without reading its leaves */
++    rc = btreeSetHasContent(pBt, iPage);
++    if( rc ) goto freepage_out;
++  }
+   TRACE(("FREE-PAGE: %u new trunk page replacing %u\n", pPage->pgno, iTrunk));
+ 
+ freepage_out:
+@@ -6979,13 +7562,36 @@
+ static SQLITE_NOINLINE int clearCellOverflow(
+   MemPage *pPage,          /* The page that contains the Cell */
+   unsigned char *pCell,    /* First byte of the Cell */
+-  CellInfo *pInfo          /* Size information about the cell */
++  CellInfo *pInfo,         /* Size information about the cell */
++  int bReuse               /* Freed pages are about to be reallocated */
+ ){
+   BtShared *pBt;
+   Pgno ovflPgno;
+   int rc;
+   int nOvfl;
+   u32 ovflPageSize;
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++  /* OvVec: next-pointer prefetch. aPre[k] is the next-page pointer stored
++  ** in page (preStart + preDir*k), for k in iPre..nPre-1. */
++  Pgno aPre[SQLITE_OVVEC_MAX_PAGES];
++  int nPre = 0;
++  int iPre = 0;
++  Pgno preStart = 0;
++  int preDir = 0;
++  Pgno prevPgno = 0;
++  /* An overwrite hands the freed pages straight back to fillInCell(), and
++  ** allocateBtreePage() must then load each one because freePage2() marked
++  ** it as having content. There an ascending run is left to the stock read,
++  ** whose page the reallocation finds in the cache and whose neighbours
++  ** kernel readahead has already fetched; batching would only read it twice.
++  ** A descending run defeats readahead, so it is still worth one preadv()
++  ** to bring the whole extent into the OS cache. None of this applies when
++  ** btreeAvoidFreshPages() holds: the freed pages then stay on the free-list
++  ** until the transaction commits. */
++  int ovvecWin = 8;
++  int bOvvec = 0;
++  unsigned char *pSink = 0;
++#endif
+ 
+   assert( sqlite3_mutex_held(pPage->pBt->mutex) );
+   assert( pInfo->nLocal!=pInfo->nPayload );
+@@ -7003,6 +7609,19 @@
+   assert( nOvfl>0 ||
+     (CORRUPT_DB && (pInfo->nPayload + ovflPageSize)<ovflPageSize)
+   );
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++  /* OvVec: freeing a chain only needs each page's 4-byte next pointer.
++  ** With auto-vacuum the pointer map already supplies it for contiguous
++  ** chains (see getOverflowPage()) and secure-delete must load every page
++  ** anyway, so only the default configuration takes this path. */
++  if( nOvfl>=3
++   && !pBt->autoVacuum
++   && (pBt->btsFlags & BTS_SECURE_DELETE)==0
++  ){
++    pSink = (unsigned char*)sqlite3_malloc(pBt->pageSize);
++    bOvvec = pSink!=0;
++  }
++#endif
+   while( nOvfl-- ){
+     Pgno iNext = 0;
+     MemPage *pOvfl = 0;
+@@ -7010,11 +7629,112 @@
+       /* 0 is not a legal page number and page 1 cannot be an
+       ** overflow page. Therefore if ovflPgno<2 or past the end of the
+       ** file the database must be corrupt. */
+-      return SQLITE_CORRUPT_BKPT;
++      rc = SQLITE_CORRUPT_BKPT;
++      goto clear_overflow_out;
+     }
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++    if( nOvfl && bOvvec ){
++      int bHave = 0;
++      Pgno iPre2;
++      if( iPre<nPre
++       && ovflPgno==preStart+(Pgno)(preDir*iPre)
++       && ovflPgno!=prevPgno
++      ){
++        bHave = 1;
++      }else if( prevPgno && ovflPgno>=2
++             && (ovflPgno==prevPgno+1 || ovflPgno+1==prevPgno) ){
++        /* The chain has stepped by one page: guess the run goes on in the
++        ** same direction and pick up the pointers of up to ovvecWin pages
++        ** with one vectored read. */
++        int dir = ovflPgno>prevPgno ? 1 : -1;
++        int n = (bReuse && dir>0 && !btreeAvoidFreshPages(pBt)) ? 0 : ovvecWin;
++        int j;
++        Pgno nPg = btreePagecount(pBt);
++        int nMaxByte = SQLITE_OVVEC_MAX_BYTES / (int)pBt->pageSize;
++        if( n>nOvfl ) n = nOvfl;
++        if( n>nMaxByte ) n = nMaxByte;
++        if( dir>0 ){
++          if( (i64)ovflPgno+n-1>(i64)nPg ) n = (int)(nPg-ovflPgno+1);
++        }else{
++          if( (i64)ovflPgno-n+1<2 ) n = (int)(ovflPgno-1);
++        }
++        for(j=0; j<n; j++){
++          Pgno pg = ovflPgno + (Pgno)(dir*j);
++          DbPage *pCached;
++          if( pg==PENDING_BYTE_PAGE(pBt)
++           || !sqlite3PagerOvvecDiskOk(pBt->pPager, pg)
++          ){
++            break;
++          }
++          /* A cached page may be dirty and newer than the file; it could
++          ** also be spilled and evicted before it is consumed, after which
++          ** the lookup below would no longer catch it. Stop short of it. */
++          pCached = sqlite3PagerLookup(pBt->pPager, pg);
++          if( pCached ){
++            sqlite3PagerUnref(pCached);
++            break;
++          }
++        }
++        n = j;
++        nPre = iPre = 0;
++        if( n>=2 ){
++          unsigned char aNext[SQLITE_OVVEC_MAX_PAGES*4];
++          OvVecReadReq x;
++          sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
++          Pgno lo = dir>0 ? ovflPgno : ovflPgno-(Pgno)(n-1);
++          x.iOffset = (i64)pBt->pageSize * (i64)(lo-1);
++          x.nPage = n;
++          x.dir = dir;
++          x.szPage = (int)pBt->pageSize;
++          x.szPayload = (int)pBt->pageSize - 4;
++          x.pOut = pSink;
++          x.aNext = aNext;
++          x.bSink = 1;
++          if( sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x)
++                ==SQLITE_OK
++          ){
++            /* Keep the prefix that really is the chain: every pointer up to
++            ** and including the first one that leaves the run. */
++            for(j=0; j<n; j++){
++              aPre[j] = get4byte(&aNext[j*4]);
++              if( aPre[j]!=ovflPgno+(Pgno)(dir*(j+1)) ){ j++; break; }
++            }
++            nPre = j;
++            preStart = ovflPgno;
++            preDir = dir;
++            if( nPre==n && n==ovvecWin ){
++              ovvecWin *= 2;
++              if( ovvecWin>SQLITE_OVVEC_MAX_PAGES ){
++                ovvecWin = SQLITE_OVVEC_MAX_PAGES;
++              }
++            }else if( nPre<n ){
++              ovvecWin = 8;
++            }
++            bHave = 1;
++          }
++        }
++      }
++      if( bHave ){
++        iPre2 = aPre[iPre++];
++        /* A page held in the cache may be newer than the file: read it
++        ** there, exactly as the stock path would. */
++        pOvfl = btreePageLookup(pBt, ovflPgno);
++        if( pOvfl ){
++          iNext = get4byte(pOvfl->aData);
++          if( iNext!=iPre2 ) nPre = iPre = 0;
++        }else{
++          iNext = iPre2;
++        }
++      }else{
++        rc = getOverflowPage(pBt, ovflPgno, &pOvfl, &iNext);
++        if( rc ) goto clear_overflow_out;
++      }
++      prevPgno = ovflPgno;
++    }else
++#endif
+     if( nOvfl ){
+       rc = getOverflowPage(pBt, ovflPgno, &pOvfl, &iNext);
+-      if( rc ) return rc;
++      if( rc ) goto clear_overflow_out;
+     }
+ 
+     if( ( pOvfl || ((pOvfl = btreePageLookup(pBt, ovflPgno))!=0) )
+@@ -7038,10 +7758,17 @@
+     if( pOvfl ){
+       sqlite3PagerUnref(pOvfl->pDbPage);
+     }
+-    if( rc ) return rc;
++    if( rc ) goto clear_overflow_out;
+     ovflPgno = iNext;
+   }
+-  return SQLITE_OK;
++  rc = SQLITE_OK;
++clear_overflow_out:
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++  sqlite3_free(pSink);
++#else
++  UNUSED_PARAMETER(bReuse);
++#endif
++  return rc;
+ }
+ 
+ /* Call xParseCell to compute the size of a cell.  If the cell contains
+@@ -7050,12 +7777,12 @@
+ **
+ ** Implemented as macro to force inlining for performance.
+ */
+-#define BTREE_CLEAR_CELL(rc, pPage, pCell, sInfo)   \
+-  pPage->xParseCell(pPage, pCell, &sInfo);          \
+-  if( sInfo.nLocal!=sInfo.nPayload ){               \
+-    rc = clearCellOverflow(pPage, pCell, &sInfo);   \
+-  }else{                                            \
+-    rc = SQLITE_OK;                                 \
++#define BTREE_CLEAR_CELL(rc, pPage, pCell, sInfo, bReuse)   \
++  pPage->xParseCell(pPage, pCell, &sInfo);                  \
++  if( sInfo.nLocal!=sInfo.nPayload ){                       \
++    rc = clearCellOverflow(pPage, pCell, &sInfo, bReuse);   \
++  }else{                                                    \
++    rc = SQLITE_OK;                                         \
+   }
+ 
+ 
+@@ -9353,6 +10080,169 @@
+ }
+ 
+ /*
++** Return true if bytes iOffset..iOffset+iAmt-1 of the content described by
++** pX differ from pDest. Mirrors btreeOverwriteContent() without writing.
++*/
++static int btreeContentDiffers(
++  const u8 *pDest,
++  const BtreePayload *pX,
++  int iOffset,
++  int iAmt
++){
++  int nData = pX->nData - iOffset;
++  int i;
++  if( nData<=0 ){
++    for(i=0; i<iAmt && pDest[i]==0; i++){}
++    return i<iAmt;
++  }
++  if( nData<iAmt ){
++    for(i=nData; i<iAmt && pDest[i]==0; i++){}
++    if( i<iAmt ) return 1;
++    iAmt = nData;
++  }
++  return memcmp(pDest, ((const u8*)pX->pData) + iOffset, iAmt)!=0;
++}
++
++/*
++** Return true if a same-size overwrite of the overflow cell under pCur
++** should be done as a fresh insert instead.
++**
++** In place, every overflow page whose bytes change is first copied to the
++** rollback journal and then rewritten: 2*D pages for D changed pages. A
++** fresh chain costs its N pages once, taken from leaves freed before this
++** transaction or appended (see btreeAllocOldLeaf()), none of which need a
++** journal record. So when more than half the chain changes -- the value
++** was replaced rather than touched up -- copying writes fewer bytes. When
++** only other columns of the row change, D is 0 and the in-place path stays.
++**
++** Pages that are not cached are read straight from the file, a contiguous
++** run at a time, into scratch memory: the old value has usually just been
++** read the same way to compute the new one, so going through the pager here
++** would load every page a second time only to compare it. Any oddity is left
++** for the stock path to diagnose.
++*/
++static int btreeOverwriteByCopy(BtCursor *pCur, const BtreePayload *pX){
++  MemPage *pPage = pCur->pPage;
++  BtShared *pBt = pPage->pBt;
++  int nTotal = pX->nData + pX->nZero;
++  int iOffset = pCur->info.nLocal;
++  u32 ovflPageSize = pBt->usableSize - 4;
++  Pgno ovflPgno;
++  int nPage, nLeft, nDiff = 0;
++  int bCopy = 0;
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++  unsigned char aNext[SQLITE_OVVEC_MAX_PAGES*4];
++  u8 *pScratch = 0;
++  int nScratch = 0;
++  int nWin = 8;
++  Pgno prevPgno = 0;
++#endif
++
++  if( iOffset>=nTotal || !btreeAvoidFreshPages(pBt) ) return 0;
++  nPage = (nTotal - iOffset + ovflPageSize - 1)/ovflPageSize;
++  if( nPage<4 ) return 0;
++  nLeft = nPage;
++  if( pCur->info.pPayload + iOffset + 4 > pPage->aDataEnd ) return 0;
++  ovflPgno = get4byte(pCur->info.pPayload + iOffset);
++  while( iOffset<nTotal ){
++    u32 amt;
++    if( ovflPgno<2 || ovflPgno>btreePagecount(pBt) ) goto overwrite_out;
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++    {
++      /* One page, or a run in the direction of the last step */
++      int dir = 1, n = 1, j;
++      Pgno nPg = btreePagecount(pBt);
++      if( prevPgno && (ovflPgno==prevPgno+1 || ovflPgno+1==prevPgno) ){
++        dir = ovflPgno>prevPgno ? 1 : -1;
++        n = nWin;
++        if( n>nLeft ) n = nLeft;
++        if( n>SQLITE_OVVEC_MAX_BYTES/(int)pBt->pageSize ){
++          n = SQLITE_OVVEC_MAX_BYTES/(int)pBt->pageSize;
++        }
++        if( dir>0 && (i64)ovflPgno+n-1>(i64)nPg ) n = (int)(nPg-ovflPgno+1);
++        if( dir<0 && (i64)ovflPgno-n+1<2 ) n = (int)(ovflPgno-1);
++      }
++      for(j=0; j<n; j++){
++        Pgno pg = ovflPgno + (Pgno)(dir*j);
++        if( pg==PENDING_BYTE_PAGE(pBt) || !ovvecDirectReadOk(pBt, pg) ) break;
++      }
++      n = j;
++      if( n>0 && nScratch<n ){
++        sqlite3_free(pScratch);
++        nScratch = nLeft<SQLITE_OVVEC_MAX_PAGES ? nLeft : SQLITE_OVVEC_MAX_PAGES;
++        if( nScratch<n ) nScratch = n;
++        pScratch = sqlite3_malloc64((i64)nScratch*(pBt->pageSize-4));
++        if( pScratch==0 ){ nScratch = 0; n = 0; }
++      }
++      if( n>0 ){
++        OvVecReadReq x;
++        sqlite3_file *fd = sqlite3PagerFile(pBt->pPager);
++        Pgno lo = dir>0 ? ovflPgno : ovflPgno-(Pgno)(n-1);
++        x.iOffset = (i64)pBt->pageSize * (i64)(lo-1);
++        x.nPage = n;
++        x.dir = dir;
++        x.szPage = (int)pBt->pageSize;
++        x.szPayload = (int)pBt->pageSize - 4;
++        x.pOut = pScratch;
++        x.aNext = aNext;
++        x.bSink = 0;
++        if( sqlite3OsFileControl(fd, SQLITE_FCNTL_OVVEC_READ, &x)!=SQLITE_OK ){
++          goto overwrite_out;
++        }
++        for(j=0; j<n; j++){
++          Pgno pg = ovflPgno + (Pgno)(dir*j);
++          Pgno pgNext = get4byte(&aNext[j*4]);
++          amt = ovflPageSize;
++          if( iOffset+ovflPageSize>=(u32)nTotal ) amt = nTotal - iOffset;
++          nDiff += btreeContentDiffers(&pScratch[j*x.szPayload], pX,
++                                       iOffset, amt);
++          iOffset += amt;
++          nLeft--;
++          if( nDiff*2>nPage ){ bCopy = 1; goto overwrite_out; }
++          if( (nDiff+nLeft)*2<=nPage || iOffset>=nTotal ) goto overwrite_out;
++          prevPgno = pg;
++          ovflPgno = pgNext;
++          /* The rest of the batch counts only while the chain stays on it */
++          if( pgNext!=pg+(Pgno)dir ){ j++; break; }
++        }
++        if( j==n && n==nWin && nWin<SQLITE_OVVEC_MAX_PAGES ){
++          nWin *= 2;
++        }else if( j<n ){
++          nWin = 8;
++        }
++        continue;
++      }
++    }
++#endif
++    {
++      MemPage *pOvfl;
++      amt = ovflPageSize;
++      if( btreeGetPage(pBt, ovflPgno, &pOvfl, 0) ) goto overwrite_out;
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++      prevPgno = ovflPgno;
++#endif
++      if( iOffset+ovflPageSize<(u32)nTotal ){
++        ovflPgno = get4byte(pOvfl->aData);
++      }else{
++        amt = nTotal - iOffset;
++      }
++      nDiff += btreeContentDiffers(pOvfl->aData+4, pX, iOffset, amt);
++      sqlite3PagerUnref(pOvfl->pDbPage);
++      iOffset += amt;
++      nLeft--;
++      /* Stop as soon as the answer is settled either way */
++      if( nDiff*2>nPage ){ bCopy = 1; goto overwrite_out; }
++      if( (nDiff+nLeft)*2<=nPage ) goto overwrite_out;
++    }
++  }
++overwrite_out:
++#ifdef SQLITE_DIRECT_OVERFLOW_READ
++  sqlite3_free(pScratch);
++#endif
++  return bCopy;
++}
++
++/*
+ ** Overwrite the cell that cursor pCur is pointing to with fresh content
+ ** contained in pX.
+ */
+@@ -9501,8 +10391,11 @@
+       if( pCur->info.nSize!=0
+        && pCur->info.nPayload==(u32)pX->nData+pX->nZero
+       ){
+-        /* New entry is the same size as the old.  Do an overwrite */
+-        return btreeOverwriteCell(pCur, pX);
++        /* New entry is the same size as the old.  Do an overwrite, unless
++        ** it replaces most of a large value (see btreeOverwriteByCopy()) */
++        if( !btreeOverwriteByCopy(pCur, pX) ){
++          return btreeOverwriteCell(pCur, pX);
++        }
+       }
+       assert( loc==0 );
+     }else if( loc==0 ){
+@@ -9619,7 +10512,7 @@
+     if( !pPage->leaf ){
+       memcpy(newCell, oldCell, 4);
+     }
+-    BTREE_CLEAR_CELL(rc, pPage, oldCell, info);
++    BTREE_CLEAR_CELL(rc, pPage, oldCell, info, 1);
+     testcase( pCur->curFlags & BTCF_ValidOvfl );
+     invalidateOverflowCache(pCur);
+     if( info.nSize==szNew && info.nLocal==info.nPayload
+@@ -9944,7 +10837,7 @@
+   ** itself from within the page.  */
+   rc = sqlite3PagerWrite(pPage->pDbPage);
+   if( rc ) return rc;
+-  BTREE_CLEAR_CELL(rc, pPage, pCell, info);
++  BTREE_CLEAR_CELL(rc, pPage, pCell, info, 0);
+   dropCell(pPage, iCellIdx, info.nSize, &rc);
+   if( rc ) return rc;
+ 
+@@ -10240,7 +11133,7 @@
+       rc = clearDatabasePage(pBt, get4byte(pCell), 1, pnChange);
+       if( rc ) goto cleardatabasepage_out;
+     }
+-    BTREE_CLEAR_CELL(rc, pPage, pCell, info);
++    BTREE_CLEAR_CELL(rc, pPage, pCell, info, 0);
+     if( rc ) goto cleardatabasepage_out;
+   }
+   if( !pPage->leaf ){
+diff -ruN a/src/btreeInt.h b/src/btreeInt.h
+--- a/src/btreeInt.h	2026-10-02 11:22:05.540940350 +0000
++++ b/src/btreeInt.h	2026-10-02 11:22:05.541592296 +0000
+@@ -449,6 +449,8 @@
+   void (*xFreeSchema)(void*);  /* Destructor for BtShared.pSchema */
+   sqlite3_mutex *mutex; /* Non-recursive mutex required to access this object */
+   Bitvec *pHasContent;  /* Set of pages moved to free-list this transaction */
++  Pgno iOldTrunk;       /* Trunk whose leaves 0..nOldLeaf-1 predate this txn */
++  u32 nOldLeaf;         /* Number of such leaves on iOldTrunk */
+ #ifndef SQLITE_OMIT_SHARED_CACHE
+   int nRef;             /* Number of references to this structure */
+   BtShared *pNext;      /* Next on a list of sharable BtShared structs */
 diff -ruN a/src/os.h b/src/os.h
---- a/src/os.h	2026-09-22 16:41:48.951342624 +0000
-+++ b/src/os.h	2026-09-22 16:41:48.951803941 +0000
-@@ -182,6 +182,56 @@
+--- a/src/os.h	2026-10-02 11:22:05.542029468 +0000
++++ b/src/os.h	2026-10-02 11:22:05.542405666 +0000
+@@ -182,6 +182,86 @@
  int sqlite3OsLock(sqlite3_file*, int);
  int sqlite3OsUnlock(sqlite3_file*, int);
  int sqlite3OsCheckReservedLock(sqlite3_file *id, int *pResOut);
@@ -483,14 +1158,44 @@ diff -ruN a/src/os.h b/src/os.h
 +  int szPayload;            /* szPage - 4 */
 +  unsigned char *pOut;      /* Final BLOB destination */
 +  unsigned char *aNext;     /* 4 bytes per page */
++  int bSink;                /* pOut is one szPayload buffer reused by
++                            ** every page: only aNext[] is wanted */
++};
++
++/*
++** OvVec write side.
++**
++** Private file-control that writes a list of buffers to one contiguous run of
++** bytes with a single scatter/gather write.  The WAL append path builds every
++** frame as a 24-byte header followed by the page image, at strictly ascending
++** offsets, so a commit of N pages issues 2N write() calls for what is one
++** contiguous region; this hands the whole run over at once.
++**
++** The public sqlite3_io_methods ABI is unchanged.
++*/
++#define SQLITE_FCNTL_OVVEC_WRITE 0x4f565657
++#define SQLITE_OVVEC_MAX_IOV (SQLITE_OVVEC_MAX_PAGES*2)
++
++typedef struct OvVecIov OvVecIov;
++typedef struct OvVecWriteReq OvVecWriteReq;
++
++struct OvVecIov {
++  const void *pBuf;         /* Bytes to write */
++  int nBuf;                 /* How many of them */
++};
++
++struct OvVecWriteReq {
++  i64 iOffset;              /* Byte offset of the first buffer */
++  int nIov;                 /* Entries in aIov[] */
++  OvVecIov *aIov;           /* The buffers, in file order */
 +};
 +
  int sqlite3OsFileControl(sqlite3_file*,int,void*);
  void sqlite3OsFileControlHint(sqlite3_file*,int,void*);
  #define SQLITE_FCNTL_DB_UNCHANGED 0xca093fa0
 diff -ruN a/src/os_unix.c b/src/os_unix.c
---- a/src/os_unix.c	2026-09-22 16:41:48.952291367 +0000
-+++ b/src/os_unix.c	2026-09-22 16:41:48.952842313 +0000
+--- a/src/os_unix.c	2026-10-02 11:22:05.542769820 +0000
++++ b/src/os_unix.c	2026-10-02 11:22:05.543209577 +0000
 @@ -46,6 +46,10 @@
  #include "sqliteInt.h"
  #if SQLITE_OS_UNIX              /* This file is used on unix only */
@@ -502,7 +1207,7 @@ diff -ruN a/src/os_unix.c b/src/os_unix.c
  /*
  ** There are various methods for file locking used for concurrency
  ** control:
-@@ -4156,6 +4160,62 @@
+@@ -4156,6 +4160,97 @@
      }
  #endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */
  
@@ -541,7 +1246,8 @@ diff -ruN a/src/os_unix.c b/src/os_unix.c
 +        int slot = p->dir>0 ? i : p->nPage-1-i;
 +        aIov[i*2].iov_base = &p->aNext[slot*4];
 +        aIov[i*2].iov_len = 4;
-+        aIov[i*2+1].iov_base = &p->pOut[slot*p->szPayload];
++        aIov[i*2+1].iov_base = p->bSink ? p->pOut
++                                        : &p->pOut[slot*p->szPayload];
 +        aIov[i*2+1].iov_len = (size_t)p->szPayload;
 +      }
 +
@@ -562,6 +1268,198 @@ diff -ruN a/src/os_unix.c b/src/os_unix.c
 +    }
 +#endif
 +
++#if defined(__linux__)
++    /* OvVec: write one contiguous run of bytes with a single pwritev(). */
++    case SQLITE_FCNTL_OVVEC_WRITE: {
++      OvVecWriteReq *p = (OvVecWriteReq*)pArg;
++      struct iovec aIov[SQLITE_OVVEC_MAX_IOV];
++      ssize_t nWrite;
++      ssize_t nExpect = 0;
++      int i;
++
++      if( p==0 || p->nIov<1 || p->nIov>SQLITE_OVVEC_MAX_IOV || p->aIov==0 ){
++        return SQLITE_NOTFOUND;
++      }
++      for(i=0; i<p->nIov; i++){
++        if( p->aIov[i].pBuf==0 || p->aIov[i].nBuf<=0 ) return SQLITE_NOTFOUND;
++        aIov[i].iov_base = (void*)p->aIov[i].pBuf;
++        aIov[i].iov_len = (size_t)p->aIov[i].nBuf;
++        nExpect += p->aIov[i].nBuf;
++      }
++
++      do{
++        nWrite = pwritev(pFile->h, aIov, p->nIov, (off_t)p->iOffset);
++      }while( nWrite<0 && errno==EINTR );
++
++      if( nWrite<0 ){
++        pFile->lastErrno = errno;
++        return SQLITE_IOERR_WRITE;
++      }
++      if( nWrite!=nExpect ){
++        return SQLITE_FULL;
++      }
++      return SQLITE_OK;
++    }
++#endif
++
      case SQLITE_FCNTL_NULL_IO: {
        osClose(pFile->h);
        pFile->h = -1;
+diff -ruN a/src/pager.c b/src/pager.c
+--- a/src/pager.c	2026-10-02 11:22:05.543611683 +0000
++++ b/src/pager.c	2026-10-02 11:22:05.544073983 +0000
+@@ -823,6 +823,28 @@
+   }
+   return 1;
+ }
++
++/*
++** OvVec: return true if the database file itself holds the current
++** content of page pgno, provided the caller has already checked that the
++** page is not in the page cache. Unlike sqlite3PagerDirectReadOk() this
++** may be used inside a write transaction: a page leaves the cache only once
++** it is clean, so any page absent from the cache is either on disk or, in
++** WAL mode, in a frame (checked here). Memory-mapped pagers are left to
++** the xFetch path, which is cheaper than any read.
++*/
++int sqlite3PagerOvvecDiskOk(Pager *pPager, Pgno pgno){
++  if( pPager->fd->pMethods==0 ) return 0;
++  if( USEFETCH(pPager) ) return 0;
++#ifndef SQLITE_OMIT_WAL
++  if( pPager->pWal ){
++    u32 iRead = 0;
++    if( sqlite3WalFindFrame(pPager->pWal, pgno, &iRead) ) return 0;
++    if( iRead ) return 0;
++  }
++#endif
++  return 1;
++}
+ #endif
+ 
+ #ifndef SQLITE_OMIT_WAL
+diff -ruN a/src/pager.h b/src/pager.h
+--- a/src/pager.h	2026-10-02 11:22:05.544457524 +0000
++++ b/src/pager.h	2026-10-02 11:22:05.544821027 +0000
+@@ -212,6 +212,7 @@
+ 
+ #ifdef SQLITE_DIRECT_OVERFLOW_READ
+   int sqlite3PagerDirectReadOk(Pager *pPager, Pgno pgno);
++  int sqlite3PagerOvvecDiskOk(Pager *pPager, Pgno pgno);
+ #endif
+ 
+ #ifdef SQLITE_ENABLE_ZIPVFS
+diff -ruN a/src/wal.c b/src/wal.c
+--- a/src/wal.c	2026-10-02 11:22:05.545184481 +0000
++++ b/src/wal.c	2026-10-02 11:22:05.545578742 +0000
+@@ -4035,6 +4035,71 @@
+ ** Write a set of frames to the log. The caller must hold the write-lock
+ ** on the log file (obtained using sqlite3WalBeginWriteTransaction()).
+ */
++/*
++** OvVec: accumulate WAL frames and hand the whole run to the VFS at once.
++**
++** Frames are appended at strictly ascending, contiguous offsets, so a commit
++** is one contiguous region of the log written as two calls per page: one for
++** the 24-byte frame header and one for the page image.  Collecting them and
++** issuing a single scatter/gather write costs one syscall per batch instead
++** of two per page, and needs no contiguity test because the layout of the log
++** guarantees it.  The bytes written are unchanged, so the resulting WAL is
++** identical to one written frame by frame.
++*/
++typedef struct OvVecWalBatch OvVecWalBatch;
++struct OvVecWalBatch {
++  int n;                               /* Frames held */
++  i64 iOffset;                         /* Offset of the first held frame */
++  OvVecIov aIov[SQLITE_OVVEC_MAX_IOV]; /* Header and image of each frame */
++  u8 aHdr[SQLITE_OVVEC_MAX_PAGES][WAL_FRAME_HDRSIZE];
++};
++
++static int ovvecWalFlush(WalWriter *p, OvVecWalBatch *pB){
++  OvVecWriteReq x;
++  int rc;
++  if( pB->n==0 ) return SQLITE_OK;
++  memset(&x, 0, sizeof(x));
++  x.iOffset = pB->iOffset;
++  x.nIov = pB->n*2;
++  x.aIov = pB->aIov;
++  rc = sqlite3OsFileControl(p->pFd, SQLITE_FCNTL_OVVEC_WRITE, &x);
++  if( rc==SQLITE_NOTFOUND ){
++    /* No vectored write here: write the same buffers one at a time, which is
++    ** exactly what the original code did. */
++    int i;
++    i64 iOff = pB->iOffset;
++    rc = SQLITE_OK;
++    for(i=0; i<pB->n*2 && rc==SQLITE_OK; i++){
++      rc = walWriteToLog(p, (void*)pB->aIov[i].pBuf, pB->aIov[i].nBuf, iOff);
++      iOff += pB->aIov[i].nBuf;
++    }
++  }
++  if( rc==SQLITE_OK ) pB->n = 0;
++  return rc;
++}
++
++static int ovvecWalAdd(
++  WalWriter *p,                   /* Where the frames are going */
++  OvVecWalBatch *pB,              /* Batch to append to */
++  PgHdr *pPage,                   /* Page to turn into a frame */
++  int nTruncate,                  /* Commit flag for the frame header */
++  i64 iOffset                     /* Offset this frame belongs at */
++){
++  int rc;
++  if( pB->n>=SQLITE_OVVEC_MAX_PAGES ){
++    rc = ovvecWalFlush(p, pB);
++    if( rc ) return rc;
++  }
++  if( pB->n==0 ) pB->iOffset = iOffset;
++  walEncodeFrame(p->pWal, pPage->pgno, nTruncate, pPage->pData, pB->aHdr[pB->n]);
++  pB->aIov[pB->n*2].pBuf = pB->aHdr[pB->n];
++  pB->aIov[pB->n*2].nBuf = WAL_FRAME_HDRSIZE;
++  pB->aIov[pB->n*2+1].pBuf = pPage->pData;
++  pB->aIov[pB->n*2+1].nBuf = p->szPage;
++  pB->n++;
++  return SQLITE_OK;
++}
++
+ static int walFrames(
+   Wal *pWal,                      /* Wal handle to write to */
+   int szPage,                     /* Database page-size in bytes */
+@@ -4137,6 +4202,10 @@
+   szFrame = szPage + WAL_FRAME_HDRSIZE;
+ 
+   /* Write all frames into the log file exactly once */
++  {
++  OvVecWalBatch sBatch;
++  sBatch.n = 0;
++  sBatch.iOffset = 0;
+   for(p=pList; p; p=p->pDirty){
+     int nDbSize;   /* 0 normally.  Positive == commit flag */
+ 
+@@ -4155,6 +4224,11 @@
+           pWal->iReCksum = iWrite;
+         }
+         pData = p->pData;
++        /* A frame already in the log is rewritten in place, which is not
++        ** part of the run being accumulated; flush first so the two cannot
++        ** be reordered with respect to each other. */
++        rc = ovvecWalFlush(&w, &sBatch);
++        if( rc ) return rc;
+         rc = sqlite3OsWrite(pWal->pWalFd, pData, szPage, iOff);
+         if( rc ) return rc;
+         p->flags &= ~PGHDR_WAL_APPEND;
+@@ -4165,12 +4239,15 @@
+     iFrame++;
+     assert( iOffset==walFrameOffset(iFrame, szPage) );
+     nDbSize = (isCommit && p->pDirty==0) ? nTruncate : 0;
+-    rc = walWriteOneFrame(&w, p, nDbSize, iOffset);
++    rc = ovvecWalAdd(&w, &sBatch, p, nDbSize, iOffset);
+     if( rc ) return rc;
+     pLast = p;
+     iOffset += szFrame;
+     p->flags |= PGHDR_WAL_APPEND;
+   }
++  rc = ovvecWalFlush(&w, &sBatch);
++  if( rc ) return rc;
++  }
+ 
+   /* Recalculate checksums within the wal file if required. */
+   if( isCommit && pWal->iReCksum ){

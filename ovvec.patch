@@ -1207,7 +1207,7 @@ diff -ruN a/src/os_unix.c b/src/os_unix.c
  /*
  ** There are various methods for file locking used for concurrency
  ** control:
-@@ -4156,6 +4160,97 @@
+@@ -4156,6 +4160,132 @@
      }
  #endif /* __linux__ && SQLITE_ENABLE_BATCH_ATOMIC_WRITE */
  
@@ -1239,6 +1239,41 @@ diff -ruN a/src/os_unix.c b/src/os_unix.c
 +      ){
 +        return SQLITE_NOTFOUND;
 +      }
++
++#if SQLITE_MAX_MMAP_SIZE>0
++      /* If the run is memory-mapped and already resident, copy it out of
++      ** the mapping as unixRead() would: no system call at all. A preadv()
++      ** here would be slower than the stock per-page reads, which unixRead()
++      ** serves from the mapping. A run that is not resident still goes to
++      ** preadv(), which fetches it in one request instead of one page fault
++      ** per fault-around window. */
++      nExpect = (ssize_t)p->nPage * (ssize_t)p->szPage;
++      if( p->iOffset>=0 && p->iOffset+nExpect<=pFile->mmapSize ){
++        const u8 *pMap = (const u8*)pFile->pMapRegion + p->iOffset;
++        const int szSys = osGetpagesize();
++        const u8 *pLo = (const u8*)((uptr)pMap & ~(uptr)(szSys-1));
++        const u8 *pHi = pMap + nExpect;
++        size_t nSys = (size_t)((pHi - pLo + szSys - 1)/szSys);
++        unsigned char aRes[SQLITE_OVVEC_MAX_BYTES/512 + 2];
++        int bResident = 0;
++        if( nSys<=sizeof(aRes) && mincore((void*)pLo, pHi-pLo, aRes)==0 ){
++          size_t k;
++          for(k=0; k<nSys && (aRes[k]&1); k++){}
++          bResident = (k==nSys);
++        }
++        if( bResident ){
++          for(i=0; i<p->nPage; i++){
++            int slot = p->dir>0 ? i : p->nPage-1-i;
++            const u8 *pPg = pMap + (i64)i*p->szPage;
++            memcpy(&p->aNext[slot*4], pPg, 4);
++            if( !p->bSink ){
++              memcpy(&p->pOut[slot*p->szPayload], pPg+4, p->szPayload);
++            }
++          }
++          return SQLITE_OK;
++        }
++      }
++#endif
 +
 +      /* Each SQLite overflow page becomes two iovec entries:
 +      ** [4-byte pointer][payload]. */

@@ -10,7 +10,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  }
  
  /*
-@@ -5122,6 +5124,167 @@
+@@ -5122,6 +5124,170 @@
  **   * A commit in auto_vacuum="full" mode,
  **   * Creating a table (may require moving an overflow page).
  */
@@ -127,6 +127,9 @@ diff -ruN a/src/btree.c b/src/btree.c
 +  u8 *pSink;
 +  int dir, n, j;
 +
++  /* With auto-vacuum, getOverflowPage() finds most successors in the
++  ** pointer map without reading the page at all, which beats any read. */
++  if( pBt->autoVacuum ) return;
 +  if( nSkip<2 || pBt->usableSize!=pBt->pageSize ) return;
 +  if( iIdx==0 ){
 +    dir = 1;              /* first page: guess the chain runs forward */
@@ -178,7 +181,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  static int accessPayload(
    BtCursor *pCur,      /* Cursor pointing to entry to read from */
    u32 offset,          /* Begin reading this far into payload */
-@@ -5136,6 +5299,17 @@
+@@ -5136,6 +5302,17 @@
    BtShared *pBt = pCur->pBt;                  /* Btree this cursor belongs to */
  #ifdef SQLITE_DIRECT_OVERFLOW_READ
    unsigned char * const pBufStart = pBuf;     /* Start of original out buffer */
@@ -196,7 +199,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  #endif
  
    assert( pPage );
-@@ -5245,6 +5419,13 @@
+@@ -5245,6 +5422,13 @@
          */
          assert( pCur->curFlags & BTCF_ValidOvfl );
          assert( pCur->pBtree->db==pBt->db );
@@ -210,7 +213,7 @@ diff -ruN a/src/btree.c b/src/btree.c
          if( pCur->aOverflow[iIdx+1] ){
            nextPage = pCur->aOverflow[iIdx+1];
          }else{
-@@ -5265,7 +5446,7 @@
+@@ -5265,7 +5449,7 @@
          **
          **   1) this is a read operation, and
          **   2) data is required from the start of this overflow page, and
@@ -219,7 +222,7 @@ diff -ruN a/src/btree.c b/src/btree.c
          **   4) the database is file-backed, and
          **   5) the page is not in the WAL file
          **   6) at least 4 bytes have already been read into the output buffer
-@@ -5276,17 +5457,346 @@
+@@ -5276,17 +5460,346 @@
          */
          if( eOp==0                                             /* (1) */
           && offset==0                                          /* (2) */
@@ -574,7 +577,7 @@ diff -ruN a/src/btree.c b/src/btree.c
          }else
  #endif
  
-@@ -6511,6 +7021,150 @@
+@@ -6511,6 +7024,150 @@
  ** to nearby if any such page exists.  If eMode is BTALLOC_ANY then there
  ** are no restrictions on which page is returned.
  */
@@ -725,7 +728,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  static int allocateBtreePage(
    BtShared *pBt,         /* The btree */
    MemPage **ppPage,      /* Store pointer to the allocated page here */
-@@ -6537,6 +7191,14 @@
+@@ -6537,6 +7194,14 @@
    if( n>=mxPage ){
      return SQLITE_CORRUPT_BKPT;
    }
@@ -740,7 +743,7 @@ diff -ruN a/src/btree.c b/src/btree.c
    if( n>0 ){
      /* There are pages on the freelist.  Reuse one of those pages. */
      Pgno iTrunk;
-@@ -6753,6 +7415,7 @@
+@@ -6753,6 +7418,7 @@
        pPrevTrunk = 0;
      }while( searchList );
    }else{
@@ -748,7 +751,7 @@ diff -ruN a/src/btree.c b/src/btree.c
      /* There are no pages on the freelist, so append a new page to the
      ** database image.
      **
-@@ -6957,6 +7620,11 @@
+@@ -6957,6 +7623,11 @@
    put4byte(pPage->aData, iTrunk);
    put4byte(&pPage->aData[4], 0);
    put4byte(&pPage1->aData[32], iPage);
@@ -760,7 +763,7 @@ diff -ruN a/src/btree.c b/src/btree.c
    TRACE(("FREE-PAGE: %u new trunk page replacing %u\n", pPage->pgno, iTrunk));
  
  freepage_out:
-@@ -6979,13 +7647,36 @@
+@@ -6979,13 +7650,36 @@
  static SQLITE_NOINLINE int clearCellOverflow(
    MemPage *pPage,          /* The page that contains the Cell */
    unsigned char *pCell,    /* First byte of the Cell */
@@ -798,7 +801,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  
    assert( sqlite3_mutex_held(pPage->pBt->mutex) );
    assert( pInfo->nLocal!=pInfo->nPayload );
-@@ -7003,6 +7694,19 @@
+@@ -7003,6 +7697,19 @@
    assert( nOvfl>0 ||
      (CORRUPT_DB && (pInfo->nPayload + ovflPageSize)<ovflPageSize)
    );
@@ -818,7 +821,7 @@ diff -ruN a/src/btree.c b/src/btree.c
    while( nOvfl-- ){
      Pgno iNext = 0;
      MemPage *pOvfl = 0;
-@@ -7010,11 +7714,112 @@
+@@ -7010,11 +7717,112 @@
        /* 0 is not a legal page number and page 1 cannot be an
        ** overflow page. Therefore if ovflPgno<2 or past the end of the
        ** file the database must be corrupt. */
@@ -933,7 +936,7 @@ diff -ruN a/src/btree.c b/src/btree.c
      }
  
      if( ( pOvfl || ((pOvfl = btreePageLookup(pBt, ovflPgno))!=0) )
-@@ -7038,10 +7843,17 @@
+@@ -7038,10 +7846,17 @@
      if( pOvfl ){
        sqlite3PagerUnref(pOvfl->pDbPage);
      }
@@ -953,7 +956,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  }
  
  /* Call xParseCell to compute the size of a cell.  If the cell contains
-@@ -7050,12 +7862,12 @@
+@@ -7050,12 +7865,12 @@
  **
  ** Implemented as macro to force inlining for performance.
  */
@@ -972,7 +975,7 @@ diff -ruN a/src/btree.c b/src/btree.c
    }
  
  
-@@ -9353,6 +10165,169 @@
+@@ -9353,6 +10168,169 @@
  }
  
  /*
@@ -1142,7 +1145,7 @@ diff -ruN a/src/btree.c b/src/btree.c
  ** Overwrite the cell that cursor pCur is pointing to with fresh content
  ** contained in pX.
  */
-@@ -9501,8 +10476,11 @@
+@@ -9501,8 +10479,11 @@
        if( pCur->info.nSize!=0
         && pCur->info.nPayload==(u32)pX->nData+pX->nZero
        ){
@@ -1156,7 +1159,7 @@ diff -ruN a/src/btree.c b/src/btree.c
        }
        assert( loc==0 );
      }else if( loc==0 ){
-@@ -9619,7 +10597,7 @@
+@@ -9619,7 +10600,7 @@
      if( !pPage->leaf ){
        memcpy(newCell, oldCell, 4);
      }
@@ -1165,7 +1168,7 @@ diff -ruN a/src/btree.c b/src/btree.c
      testcase( pCur->curFlags & BTCF_ValidOvfl );
      invalidateOverflowCache(pCur);
      if( info.nSize==szNew && info.nLocal==info.nPayload
-@@ -9944,7 +10922,7 @@
+@@ -9944,7 +10925,7 @@
    ** itself from within the page.  */
    rc = sqlite3PagerWrite(pPage->pDbPage);
    if( rc ) return rc;
@@ -1174,7 +1177,7 @@ diff -ruN a/src/btree.c b/src/btree.c
    dropCell(pPage, iCellIdx, info.nSize, &rc);
    if( rc ) return rc;
  
-@@ -10240,7 +11218,7 @@
+@@ -10240,7 +11221,7 @@
        rc = clearDatabasePage(pBt, get4byte(pCell), 1, pnChange);
        if( rc ) goto cleardatabasepage_out;
      }

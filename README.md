@@ -1,5 +1,10 @@
 # OvVec
 
+![Built on SQLite 3.53.4](https://img.shields.io/badge/built%20on-SQLite%203.53.4-003b57)
+![License: CC0 1.0](https://img.shields.io/badge/license-CC0%201.0-green)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
+![Language: C](https://img.shields.io/badge/language-C-555555)
+
 Make SQLite faster at reading, deleting and rewriting large values.
 
 OvVec is a patch for SQLite 3.53.4. A value larger than one database page

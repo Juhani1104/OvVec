@@ -1,9 +1,9 @@
 # OvVec
 
 ![Built on SQLite 3.53.4](https://img.shields.io/badge/built%20on-SQLite%203.53.4-003b57)
-![License](https://img.shields.io/github/license/Juhani1104/OvVec)
+![License: CC0 1.0](https://img.shields.io/badge/license-CC0%201.0-green)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
-![Top language](https://img.shields.io/github/languages/top/Juhani1104/OvVec)
+![Language: C](https://img.shields.io/badge/language-C-555555)
 ![Last commit](https://img.shields.io/github/last-commit/Juhani1104/OvVec)
 
 Make SQLite faster at reading, deleting and rewriting large values.
